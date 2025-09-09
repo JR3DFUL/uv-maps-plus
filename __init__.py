@@ -292,8 +292,3 @@ def unregister():
         from bpy.types import DATA_PT_uv_texture
         bpy.utils.register_class(DATA_PT_uv_texture)
     except (ImportError, RuntimeError): pass
-
-if __name__ == "__main__":
-    try: unregister()
-    except Exception: pass
-    register()
