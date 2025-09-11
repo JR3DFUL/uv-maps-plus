@@ -1,6 +1,6 @@
 ## UV Maps+
 
-UV Maps+ (UV Maps Plus) bypasses Blender's default 8 UV map limit, allowing you to add and organize as many UV channels as your project needs. It replaces the standard UV panel with a new one, adding buttons for reordering, duplicating, and copying data across UV Maps.
+UV Maps+ (UV Maps Plus) provides essential tools for UV map management in Blender, allowing you to reorder UV maps, copy/paste UVs between layers, and exceed the software's default 8-map limit. These capabilities are made possible by storing UV data as custom attributes, which are managed through a new, dedicated UI panel.
 
 ### Features
 
