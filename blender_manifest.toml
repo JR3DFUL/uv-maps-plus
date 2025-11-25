@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "uv_maps_plus"
 name = "UV Maps+"
-version = "1.0.3"
+version = "1.0.4"
 tagline = "Reorder UV Maps, Copy/Paste UVs, and exceed the 8-map limit"
 maintainer = "JR3DFUL"
 type = "add-on"

@@ -29,6 +29,15 @@ def rebuild_uv_maps_via_attributes(mesh, new_name_order, uv_data_backup, new_act
     if 0 <= new_active_index < len(mesh.uv_layers):
         mesh.uv_layers.active_index = new_active_index
 
+def is_uv_selected(loop, uv_layer):
+    """Check if UV is selected, compatible with both Blender 4.2 and 5.0"""
+    # Blender 5.0+ uses loop.uv_select_vert
+    if hasattr(loop, 'uv_select_vert'):
+        return loop.uv_select_vert
+    # Blender 4.2 uses loop[uv_layer].select
+    else:
+        return loop[uv_layer].select
+
 class UV_OT_map_list_operator(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     def get_new_state(self, context, name_order, uv_data_backup, active_index):
@@ -180,10 +189,9 @@ class UV_OT_copy_selected_uvs(Operator):
             self.report({'WARNING'}, "No active UV map in Edit Mode")
             return {'CANCELLED'}
         for face in bm.faces:
-            if face.select:
-                for loop in face.loops:
-                    if loop[uv_layer].select:
-                        copied_uv_data[loop.index] = loop[uv_layer].uv.copy()
+            for loop in face.loops:
+                if is_uv_selected(loop, uv_layer):
+                    copied_uv_data[loop.index] = loop[uv_layer].uv.copy()
         self.report({'INFO'}, f"Copied {len(copied_uv_data)} UV vertices")
         return {'FINISHED'}
 
