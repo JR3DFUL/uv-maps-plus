@@ -1,302 +1,502 @@
 import bpy
 import bmesh
-from bpy.types import Operator, Menu, Panel
+from bpy.types import Operator, Menu, Panel, UIList
+from bpy.app.handlers import depsgraph_update_post
 
 copied_uv_data = {}
+_sync_state = {}
+
+def get_meshes(ctx):
+    return [o for o in ctx.selected_objects if o.type == 'MESH']
 
 def get_uv_backup(mesh):
-    uv_data_backup = {}
-    num_loop_vectors = len(mesh.loops) * 2
+    backup, n = {}, len(mesh.loops) * 2
     for layer in mesh.uv_layers:
+        c = [0.0] * n
         if hasattr(layer.data, 'foreach_get') and len(layer.data) == len(mesh.loops):
-            uv_coords = [0.0] * num_loop_vectors
-            layer.data.foreach_get('uv', uv_coords)
-            uv_data_backup[layer.name] = uv_coords
-        else:
-            uv_data_backup[layer.name] = [0.0] * num_loop_vectors
-    return uv_data_backup
+            layer.data.foreach_get('uv', c)
+        backup[layer.name] = c
+    return backup
 
-def rebuild_uv_maps_via_attributes(mesh, new_name_order, uv_data_backup, new_active_index):
-    original_active_render_name = next((layer.name for layer in mesh.uv_layers if layer.active_render), None)
+def rebuild_uvs(mesh, names, backup, idx):
+    render = next((l.name for l in mesh.uv_layers if l.active_render), None)
     while mesh.uv_layers:
         mesh.uv_layers.remove(mesh.uv_layers[0])
-    for name in new_name_order:
-        new_uv_attr = mesh.attributes.new(name=name, type='FLOAT2', domain='CORNER')
-        if name in uv_data_backup and uv_data_backup[name]:
-            new_uv_attr.data.foreach_set('vector', uv_data_backup[name])
-    if original_active_render_name in new_name_order and original_active_render_name in mesh.uv_layers:
-        mesh.uv_layers[original_active_render_name].active_render = True
-    if 0 <= new_active_index < len(mesh.uv_layers):
-        mesh.uv_layers.active_index = new_active_index
+    for name in names:
+        attr = mesh.attributes.new(name=name, type='FLOAT2', domain='CORNER')
+        if name in backup and backup[name]:
+            attr.data.foreach_set('vector', backup[name])
+    if render in names and render in mesh.uv_layers:
+        mesh.uv_layers[render].active_render = True
+    if names and 0 <= idx < len(mesh.uv_layers):
+        mesh.uv_layers.active_index = idx
+    mesh.update()
+    for area in bpy.context.screen.areas:
+        area.tag_redraw()
 
 def is_uv_selected(loop, uv_layer):
-    """Check if UV is selected, compatible with both Blender 4.2 and 5.0"""
-    # Blender 5.0+ uses loop.uv_select_vert
-    if hasattr(loop, 'uv_select_vert'):
-        return loop.uv_select_vert
-    # Blender 4.2 uses loop[uv_layer].select
-    else:
-        return loop[uv_layer].select
+    return loop.uv_select_vert if hasattr(loop, 'uv_select_vert') else loop[uv_layer].select
 
-class UV_OT_map_list_operator(Operator):
+def available_name(objects, base="UVMap"):
+    used = {l.name for o in objects for l in o.data.uv_layers}
+    if base not in used: return base
+    i = 1
+    while f"{base}.{i:03d}" in used: i += 1
+    return f"{base}.{i:03d}"
+
+def ensure_uv(mesh, name):
+    if name not in [l.name for l in mesh.uv_layers]:
+        b = get_uv_backup(mesh)
+        n = [l.name for l in mesh.uv_layers] + [name]
+        b[name] = [0.0] * (len(mesh.loops) * 2)
+        rebuild_uvs(mesh, n, b, mesh.uv_layers.active_index if mesh.uv_layers else 0)
+
+# === TRANSFER ===
+
+def transfer_uv(src, tgt, name):
+    if len(src.loops) != len(tgt.loops): return False
+    s, t = src.uv_layers.get(name), tgt.uv_layers.get(name)
+    if not s or not t: return False
+    c = [0.0] * (len(src.loops) * 2)
+    s.data.foreach_get('uv', c)
+    t.data.foreach_set('uv', c)
+    return True
+
+# === SYNC HANDLER ===
+
+def sync_handler(scene, depsgraph):
+    ctx = bpy.context
+    if not ctx.object or ctx.object.type != 'MESH' or ctx.object.mode != 'OBJECT': return
+    objs = get_meshes(ctx)
+    if len(objs) <= 1: return
+    
+    obj, mesh = ctx.object, ctx.object.data
+    if not mesh.uv_layers: return
+    
+    oid = id(obj)
+    cur = {
+        'active': mesh.uv_layers.active.name if mesh.uv_layers.active else None,
+        'render': next((l.name for l in mesh.uv_layers if l.active_render), None),
+        'names': [l.name for l in mesh.uv_layers]
+    }
+    
+    if oid in _sync_state:
+        last = _sync_state[oid]
+        for o in objs:
+            if o == obj: continue
+            m = o.data
+            # Sync active
+            if cur['active'] and cur['active'] != last.get('active') and cur['active'] in [l.name for l in m.uv_layers]:
+                m.uv_layers.active = m.uv_layers[cur['active']]
+            # Sync render
+            if cur['render'] and cur['render'] != last.get('render') and cur['render'] in [l.name for l in m.uv_layers]:
+                m.uv_layers[cur['render']].active_render = True
+            # Sync renames
+            ln = last.get('names', [])
+            if len(ln) == len(cur['names']):
+                for old, new in zip(ln, cur['names']):
+                    if old != new and old in [l.name for l in m.uv_layers] and new not in [l.name for l in m.uv_layers]:
+                        m.uv_layers[old].name = new
+    
+    _sync_state[oid] = cur
+
+# === BASE OPERATOR ===
+
+class UV_OT_base(Operator):
     bl_options = {'REGISTER', 'UNDO'}
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        raise NotImplementedError()
-    def execute(self, context):
-        mesh = context.object.data
-        active_index = mesh.uv_layers.active_index
-        uv_data_backup = get_uv_backup(mesh)
-        name_order = [layer.name for layer in mesh.uv_layers]
-        new_name_order, new_uv_data_backup, new_active_index = self.get_new_state(context, name_order, uv_data_backup, active_index)
-        rebuild_uv_maps_via_attributes(mesh, new_name_order, new_uv_data_backup, new_active_index)
+    def get_state(self, ctx, names, backup, idx): raise NotImplementedError()
+    def execute(self, ctx):
+        mesh = ctx.object.data
+        names, backup, idx = [l.name for l in mesh.uv_layers], get_uv_backup(mesh), mesh.uv_layers.active_index
+        new_names, new_backup, new_idx = self.get_state(ctx, names, backup, idx)
+        rebuild_uvs(mesh, new_names, new_backup, new_idx)
         return {'FINISHED'}
 
-class UV_OT_add_map(UV_OT_map_list_operator):
+# === OPERATORS ===
+
+class UV_OT_add(UV_OT_base):
     bl_idname = "uv.add_map"
     bl_label = "Add UV Map"
-    bl_description = "Add a new, blank UV map. Bypasses the 8-map limit. (Available in Object Mode only)"
+    bl_description = "Add a new UV map to all selected objects. Bypasses 8-map limit"
     @classmethod
-    def poll(cls, context): return context.object and context.object.mode == 'OBJECT'
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        new_name = "UVMap"
-        counter = 1
-        while new_name in uv_data_backup:
-            new_name = f"UVMap.{counter:03d}"
-            counter += 1
-        name_order.append(new_name)
-        uv_data_backup[new_name] = [0.0] * (len(context.object.data.loops) * 2)
-        return name_order, uv_data_backup, len(name_order) - 1
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT'
+    def get_state(self, ctx, names, backup, idx):
+        objs = get_meshes(ctx) or [ctx.object]
+        name = available_name(objs)
+        for o in objs:
+            if o != ctx.object:
+                ensure_uv(o.data, name)
+        names.append(name)
+        backup[name] = [0.0] * (len(ctx.object.data.loops) * 2)
+        return names, backup, len(names) - 1
 
-class UV_OT_remove_map(UV_OT_map_list_operator):
+class UV_OT_remove(UV_OT_base):
     bl_idname = "uv.remove_map"
     bl_label = "Remove UV Map"
-    bl_description = "Remove the selected UV map. (Available in Object Mode only)"
+    bl_description = "Remove the active UV map from all selected objects (if available)"
     @classmethod
-    def poll(cls, context): return context.object and context.object.data.uv_layers.active is not None and context.object.mode == 'OBJECT'
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        del uv_data_backup[name_order.pop(active_index)]
-        new_active_index = min(active_index, len(name_order) - 1)
-        return name_order, uv_data_backup, new_active_index
+    def poll(cls, ctx): return ctx.object and ctx.object.data.uv_layers.active and ctx.object.mode == 'OBJECT'
+    def get_state(self, ctx, names, backup, idx):
+        name = names[idx]
+        for o in get_meshes(ctx):
+            if o != ctx.object and name in [l.name for l in o.data.uv_layers]:
+                b = get_uv_backup(o.data)
+                n = [l.name for l in o.data.uv_layers]
+                i = n.index(name)
+                del b[name]; n.remove(name)
+                rebuild_uvs(o.data, n, b, min(i, len(n)-1) if n else -1)
+        del backup[name]; names.remove(name)
+        return names, backup, min(idx, len(names)-1) if names else -1
+    def invoke(self, ctx, event):
+        name = ctx.object.data.uv_layers.active.name
+        if len([o for o in get_meshes(ctx) if name in [l.name for l in o.data.uv_layers]]) > 1:
+            return ctx.window_manager.invoke_confirm(self, event)
+        return self.execute(ctx)
 
-class UV_OT_duplicate_selected(UV_OT_map_list_operator):
-    bl_idname = "uv.duplicate_selected"
-    bl_label = "Duplicate Selected UV Map"
-    bl_description = "Duplicates the selected UV map. (Available in Object Mode only)"
+class UV_OT_duplicate(UV_OT_base):
+    bl_idname = "uv.duplicate_map"
+    bl_label = "Duplicate UV Map"
+    bl_description = "Duplicate the active UV map on all selected objects (if available)"
     @classmethod
-    def poll(cls, context): return context.object and context.object.data.uv_layers.active is not None and context.object.mode == 'OBJECT'
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        original_name = name_order[active_index]
-        new_name = original_name
-        counter = 1
-        while new_name in uv_data_backup:
-            new_name = f"{original_name}.{counter:03d}"
-            counter += 1
-        target_index = active_index + 1
-        name_order.insert(target_index, new_name)
-        uv_data_backup[new_name] = uv_data_backup[original_name][:]
-        self.report({'INFO'}, f"Duplicated '{original_name}' to '{new_name}'")
-        return name_order, uv_data_backup, target_index
+    def poll(cls, ctx): return ctx.object and ctx.object.data.uv_layers.active and ctx.object.mode == 'OBJECT'
+    def get_state(self, ctx, names, backup, idx):
+        orig = names[idx]
+        objs = [o for o in get_meshes(ctx) or [ctx.object] if orig in [l.name for l in o.data.uv_layers]]
+        new = available_name(objs, orig)
+        for o in objs:
+            if o != ctx.object:
+                b = get_uv_backup(o.data)
+                n = [l.name for l in o.data.uv_layers]
+                i = n.index(orig)
+                n.insert(i+1, new)
+                b[new] = b[orig][:]
+                rebuild_uvs(o.data, n, b, o.data.uv_layers.active_index)
+        names.insert(idx+1, new)
+        backup[new] = backup[orig][:]
+        return names, backup, idx+1
 
-class UV_OT_reorder_map_up(UV_OT_map_list_operator):
-    bl_idname = "uv.reorder_map_up"
-    bl_label = "Move UV Map Up"
-    bl_description = "Move the selected UV map up in the list. (Available in Object Mode only)"
+class UV_OT_move(Operator):
+    bl_idname = "uv.move_map"
+    bl_label = "Move UV Map"
+    bl_description = "Move the active UV map up or down in all selected objects (if available)"
+    bl_options = {'REGISTER', 'UNDO'}
+    direction: bpy.props.EnumProperty(items=[('UP','Up',''),('DOWN','Down',''),('TOP','Top',''),('BOTTOM','Bottom','')])
     @classmethod
-    def poll(cls, context): uv_layers = context.object.data.uv_layers; return context.object.mode == 'OBJECT' and len(uv_layers) > 1 and uv_layers.active_index > 0
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        target_index = active_index - 1
-        name_order.insert(target_index, name_order.pop(active_index))
-        return name_order, uv_data_backup, target_index
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and len(ctx.object.data.uv_layers) > 1
+    def execute(self, ctx):
+        name = ctx.object.data.uv_layers.active.name
+        for o in get_meshes(ctx) or [ctx.object]:
+            m = o.data
+            n = [l.name for l in m.uv_layers]
+            if name not in n: continue
+            i = n.index(name)
+            if self.direction == 'UP' and i > 0: t = i-1
+            elif self.direction == 'DOWN' and i < len(n)-1: t = i+1
+            elif self.direction == 'TOP' and i > 0: t = 0
+            elif self.direction == 'BOTTOM' and i < len(n)-1: t = len(n)-1
+            else: continue
+            n.insert(t, n.pop(i))
+            rebuild_uvs(m, n, get_uv_backup(m), t if o == ctx.object else m.uv_layers.active_index)
+        return {'FINISHED'}
 
-class UV_OT_reorder_map_down(UV_OT_map_list_operator):
-    bl_idname = "uv.reorder_map_down"
-    bl_label = "Move UV Map Down"
-    bl_description = "Move the selected UV map down in the list. (Available in Object Mode only)"
+class UV_OT_sort(UV_OT_base):
+    bl_idname = "uv.sort_maps"
+    bl_label = "Sort UV Maps by Name"
+    bl_description = "Sort all UV maps alphabetically on all selected objects"
     @classmethod
-    def poll(cls, context): uv_layers = context.object.data.uv_layers; return context.object.mode == 'OBJECT' and len(uv_layers) > 1 and uv_layers.active_index < len(uv_layers) - 1
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        target_index = active_index + 1
-        name_order.insert(target_index, name_order.pop(active_index))
-        return name_order, uv_data_backup, target_index
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and len(ctx.object.data.uv_layers) > 1
+    def get_state(self, ctx, names, backup, idx):
+        active = names[idx]
+        for o in get_meshes(ctx):
+            if o != ctx.object and len(o.data.uv_layers) > 1:
+                n = sorted([l.name for l in o.data.uv_layers], key=str.lower)
+                a = o.data.uv_layers.active.name
+                rebuild_uvs(o.data, n, get_uv_backup(o.data), n.index(a) if a in n else 0)
+        names = sorted(names, key=str.lower)
+        return names, backup, names.index(active)
 
-class UV_OT_move_to_top(UV_OT_map_list_operator):
-    bl_idname = "uv.move_to_top"
-    bl_label = "Move to Top"
-    bl_description = "Move the selected UV map to the top of the list. (Available in Object Mode only)"
+class UV_OT_reverse(UV_OT_base):
+    bl_idname = "uv.reverse_maps"
+    bl_label = "Reverse UV Map Order"
+    bl_description = "Reverse the order of all UV maps on all selected objects"
     @classmethod
-    def poll(cls, context): uv_layers = context.object.data.uv_layers; return context.object.mode == 'OBJECT' and len(uv_layers) > 1 and uv_layers.active_index > 0
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        name_order.insert(0, name_order.pop(active_index))
-        return name_order, uv_data_backup, 0
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and len(ctx.object.data.uv_layers) > 1
+    def get_state(self, ctx, names, backup, idx):
+        active = names[idx]
+        for o in get_meshes(ctx):
+            if o != ctx.object and len(o.data.uv_layers) > 1:
+                n = [l.name for l in o.data.uv_layers][::-1]
+                a = o.data.uv_layers.active.name
+                rebuild_uvs(o.data, n, get_uv_backup(o.data), n.index(a) if a in n else 0)
+        names = names[::-1]
+        return names, backup, names.index(active)
 
-class UV_OT_move_to_bottom(UV_OT_map_list_operator):
-    bl_idname = "uv.move_to_bottom"
-    bl_label = "Move to Bottom"
-    bl_description = "Move the selected UV map to the bottom of the list. (Available in Object Mode only)"
-    @classmethod
-    def poll(cls, context): uv_layers = context.object.data.uv_layers; return context.object.mode == 'OBJECT' and len(uv_layers) > 1 and uv_layers.active_index < len(uv_layers) - 1
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        name_order.append(name_order.pop(active_index))
-        return name_order, uv_data_backup, len(name_order) - 1
-
-class UV_OT_sort_by_name(UV_OT_map_list_operator):
-    bl_idname = "uv.sort_by_name"
-    bl_label = "Sort Maps by Name"
-    bl_description = "Sort all maps alphabetically. (Available in Object Mode only)"
-    @classmethod
-    def poll(cls, context): return context.object.mode == 'OBJECT' and len(context.object.data.uv_layers) > 1
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        active_name = name_order[active_index]
-        new_name_order = sorted(name_order, key=str.lower)
-        new_active_index = new_name_order.index(active_name)
-        return new_name_order, uv_data_backup, new_active_index
-
-class UV_OT_reverse_order(UV_OT_map_list_operator):
-    bl_idname = "uv.reverse_order"
-    bl_label = "Reverse Map Order"
-    bl_description = "Reverse the order of all maps. (Available in Object Mode only)"
-    @classmethod
-    def poll(cls, context): return context.object.mode == 'OBJECT' and len(context.object.data.uv_layers) > 1
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        active_name = name_order[active_index]
-        new_name_order = list(reversed(name_order))
-        new_active_index = new_name_order.index(active_name)
-        return new_name_order, uv_data_backup, new_active_index
-
-class UV_OT_delete_all(UV_OT_map_list_operator):
-    bl_idname = "uv.delete_all"
-    bl_label = "Delete All UV Maps"
-    bl_description = "Deletes all UV maps from the object. (Available in Object Mode only)"
-    @classmethod
-    def poll(cls, context): return context.object.mode == 'OBJECT' and len(context.object.data.uv_layers) > 0
-    def get_new_state(self, context, name_order, uv_data_backup, active_index):
-        return [], {}, 0
-
-class UV_OT_copy_selected_uvs(Operator):
-    bl_idname = "uv.copy_selected_uvs"
-    bl_label = "Copy UVs"
+class UV_OT_delete_empty(Operator):
+    bl_idname = "uv.delete_empty"
+    bl_label = "Delete Empty UV Maps"
+    bl_description = "Delete UV maps with all coordinates at (0,0) from all selected objects"
     bl_options = {'REGISTER', 'UNDO'}
     @classmethod
-    def poll(cls, context):
-        obj = context.object
-        return obj and obj.type == 'MESH' and obj.data.uv_layers.active is not None and obj.mode == 'EDIT'
-    def execute(self, context):
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and ctx.object.data.uv_layers
+    def execute(self, ctx):
+        total_deleted = 0
+        for obj in get_meshes(ctx):
+            m = obj.data
+            to_delete = []
+            for layer in m.uv_layers:
+                # Check if all UVs are at origin (0,0)
+                coords = [0.0] * (len(m.loops) * 2)
+                if hasattr(layer.data, 'foreach_get'):
+                    layer.data.foreach_get('uv', coords)
+                    if all(c == 0.0 for c in coords):
+                        to_delete.append(layer.name)
+            # Delete empty maps
+            if to_delete:
+                backup = get_uv_backup(m)
+                names = [l.name for l in m.uv_layers]
+                for name in to_delete:
+                    if name in backup:
+                        del backup[name]
+                    if name in names:
+                        names.remove(name)
+                    total_deleted += 1
+                active_idx = m.uv_layers.active_index
+                rebuild_uvs(m, names, backup, min(active_idx, len(names)-1) if names else -1)
+        self.report({'INFO'}, f"Deleted {total_deleted} empty UV map(s)")
+        return {'FINISHED'}
+
+class UV_OT_delete_all(UV_OT_base):
+    bl_idname = "uv.delete_all"
+    bl_label = "Delete All UV Maps?"
+    bl_description = "Delete all UV maps from all selected objects"
+    @classmethod
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and ctx.object.data.uv_layers
+    def get_state(self, ctx, names, backup, idx):
+        for o in get_meshes(ctx):
+            if o != ctx.object and o.data.uv_layers:
+                rebuild_uvs(o.data, [], {}, -1)
+        return [], {}, -1
+    def invoke(self, ctx, event): return ctx.window_manager.invoke_confirm(self, event)
+
+class UV_OT_sync_order(Operator):
+    bl_idname = "uv.sync_order"
+    bl_label = "Sync UV Map Order"
+    bl_description = "Match UV map order on all selected objects to the active object"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and len(get_meshes(ctx)) > 1
+    def execute(self, ctx):
+        order = [l.name for l in ctx.object.data.uv_layers]
+        for o in get_meshes(ctx):
+            if o == ctx.object: continue
+            m = o.data
+            cur = [l.name for l in m.uv_layers]
+            new = [n for n in order if n in cur] + [n for n in cur if n not in order]
+            a = m.uv_layers.active.name if m.uv_layers.active else None
+            rebuild_uvs(m, new, get_uv_backup(m), new.index(a) if a in new else 0)
+        return {'FINISHED'}
+
+class UV_OT_copy_unique(Operator):
+    bl_idname = "uv.sync_names"
+    bl_label = "Sync UV Map Names"
+    bl_description = "Create missing UV maps on all objects so all have the same map names"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and len(get_meshes(ctx)) > 1
+    def execute(self, ctx):
+        all_names = []
+        for o in get_meshes(ctx):
+            for l in o.data.uv_layers:
+                if l.name not in all_names: all_names.append(l.name)
+        added = 0
+        for o in get_meshes(ctx):
+            for name in all_names:
+                if name not in [l.name for l in o.data.uv_layers]:
+                    ensure_uv(o.data, name)
+                    added += 1
+        self.report({'INFO'}, f"Added {added} UV map(s)")
+        return {'FINISHED'}
+
+class UV_OT_transfer(Operator):
+    bl_idname = "uv.transfer"
+    bl_label = "Replace All UV Maps?"
+    bl_description = "Transfer UV coordinate data from active object to others (requires matching topology)"
+    bl_options = {'REGISTER', 'UNDO'}
+    mode: bpy.props.EnumProperty(items=[('SEL','Selected',''),('ALL','All',''),('REP','Replace','')])
+    @classmethod
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'OBJECT' and ctx.object.data.uv_layers and len(get_meshes(ctx)) > 1
+    def execute(self, ctx):
+        src = ctx.object.data
+        uv_names = [src.uv_layers.active.name] if self.mode == 'SEL' else [l.name for l in src.uv_layers]
+        ok = skip = 0
+        for o in get_meshes(ctx):
+            if o == ctx.object: continue
+            t = o.data
+            if len(src.loops) != len(t.loops): skip += 1; continue
+            if self.mode == 'REP': rebuild_uvs(t, [], {}, -1)
+            for n in uv_names:
+                ensure_uv(t, n)
+                transfer_uv(src, t, n)
+            ok += 1
+        self.report({'INFO'} if ok else {'WARNING'}, f"Transferred to {ok}" + (f", skipped {skip}" if skip else ""))
+        return {'FINISHED'}
+    def invoke(self, ctx, event):
+        return ctx.window_manager.invoke_confirm(self, event) if self.mode == 'REP' else self.execute(ctx)
+
+class UV_OT_copy_uvs(Operator):
+    bl_idname = "uv.copy_uvs"
+    bl_label = "Copy UVs"
+    bl_description = "Copy selected UV coordinates in Edit Mode"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'EDIT' and ctx.object.data.uv_layers.active
+    def execute(self, ctx):
         global copied_uv_data
         copied_uv_data.clear()
-        bm = bmesh.from_edit_mesh(context.object.data)
-        uv_layer = bm.loops.layers.uv.active
-        if not uv_layer:
-            self.report({'WARNING'}, "No active UV map in Edit Mode")
-            return {'CANCELLED'}
-        for face in bm.faces:
-            for loop in face.loops:
-                if is_uv_selected(loop, uv_layer):
-                    copied_uv_data[loop.index] = loop[uv_layer].uv.copy()
-        self.report({'INFO'}, f"Copied {len(copied_uv_data)} UV vertices")
+        bm = bmesh.from_edit_mesh(ctx.object.data)
+        uv = bm.loops.layers.uv.active
+        if not uv: return {'CANCELLED'}
+        for f in bm.faces:
+            for l in f.loops:
+                if is_uv_selected(l, uv): copied_uv_data[l.index] = l[uv].uv.copy()
+        self.report({'INFO'}, f"Copied {len(copied_uv_data)} UVs")
         return {'FINISHED'}
 
-class UV_OT_paste_selected_uvs(Operator):
-    bl_idname = "uv.paste_selected_uvs"
+class UV_OT_paste_uvs(Operator):
+    bl_idname = "uv.paste_uvs"
     bl_label = "Paste UVs"
+    bl_description = "Paste copied UV coordinates in Edit Mode"
     bl_options = {'REGISTER', 'UNDO'}
     @classmethod
-    def poll(cls, context):
-        obj = context.object
-        return obj and obj.data.uv_layers.active is not None and obj.mode == 'EDIT' and copied_uv_data
-    def execute(self, context):
-        bm = bmesh.from_edit_mesh(context.object.data)
-        uv_layer = bm.loops.layers.uv.active
-        if not uv_layer:
-            self.report({'WARNING'}, "No active UV map in Edit Mode")
-            return {'CANCELLED'}
-        pasted_count = 0
-        for face in bm.faces:
-            for loop in face.loops:
-                if loop.index in copied_uv_data:
-                    loop[uv_layer].uv = copied_uv_data[loop.index]
-                    pasted_count += 1
-        bmesh.update_edit_mesh(context.object.data)
-        self.report({'INFO'}, f"Pasted {pasted_count} UV vertices")
+    def poll(cls, ctx): return ctx.object and ctx.object.mode == 'EDIT' and ctx.object.data.uv_layers.active and copied_uv_data
+    def execute(self, ctx):
+        bm = bmesh.from_edit_mesh(ctx.object.data)
+        uv = bm.loops.layers.uv.active
+        if not uv: return {'CANCELLED'}
+        n = sum(1 for f in bm.faces for l in f.loops if l.index in copied_uv_data and not (l[uv].uv.__setitem__(slice(None), copied_uv_data[l.index]) or True) or l.index in copied_uv_data)
+        for f in bm.faces:
+            for l in f.loops:
+                if l.index in copied_uv_data: l[uv].uv = copied_uv_data[l.index]
+        bmesh.update_edit_mesh(ctx.object.data)
+        self.report({'INFO'}, f"Pasted {len([1 for f in bm.faces for l in f.loops if l.index in copied_uv_data])} UVs")
         return {'FINISHED'}
 
-class UV_MT_specials_menu(Menu):
+# === MENUS ===
+
+class MESH_UL_uvmaps_plus(bpy.types.UIList):
+    """Custom UV Map list with warning colors for maps past slot 8"""
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            if index >= 8:
+                layout.alert = True
+            layout.prop(item, "name", text="", emboss=False, icon_value=icon)
+            icon = 'RESTRICT_RENDER_OFF' if item.active_render else 'RESTRICT_RENDER_ON'
+            layout.prop(item, "active_render", text="", icon=icon, emboss=False)
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon_value=icon)
+
+class UV_MT_specials(Menu):
+    bl_idname = "UV_MT_specials"
     bl_label = "UV Map Specials"
-    bl_idname = "UV_MT_specials_menu"
-    def draw(self, context):
-        layout = self.layout
-        layout.operator(UV_OT_sort_by_name.bl_idname, icon='SORTALPHA')
-        layout.operator(UV_OT_reverse_order.bl_idname, icon='SORT_DESC')
-        layout.separator()
-        layout.operator(UV_OT_move_to_top.bl_idname, icon='TRIA_UP_BAR')
-        layout.operator(UV_OT_move_to_bottom.bl_idname, icon='TRIA_DOWN_BAR')
-        layout.separator()
-        layout.operator(UV_OT_duplicate_selected.bl_idname, icon='DUPLICATE')
-        layout.operator(UV_OT_delete_all.bl_idname, icon='TRASH')
+    def draw(self, ctx):
+        l = self.layout
+        l.operator(UV_OT_sort.bl_idname, icon='SORTALPHA')
+        l.operator(UV_OT_reverse.bl_idname, icon='SORT_DESC')
+        l.separator()
+        l.operator(UV_OT_move.bl_idname, text="Move to Top", icon='TRIA_UP_BAR').direction = 'TOP'
+        l.operator(UV_OT_move.bl_idname, text="Move to Bottom", icon='TRIA_DOWN_BAR').direction = 'BOTTOM'
+        l.separator()
+        l.operator(UV_OT_duplicate.bl_idname, icon='DUPLICATE')
+        l.operator(UV_OT_delete_empty.bl_idname, icon='TRASH')
+        l.operator(UV_OT_delete_all.bl_idname, text="Delete All UV Maps", icon='TRASH')
+        if len(get_meshes(ctx)) > 1:
+            l.separator()
+            l.label(text="Batch", icon='OBJECT_DATA')
+            l.operator(UV_OT_sync_order.bl_idname, icon='SORTSIZE')
+            l.operator(UV_OT_copy_unique.bl_idname, icon='FONT_DATA')
+            l.separator()
+            l.label(text="UV Data", icon='UV')
+            l.operator(UV_OT_transfer.bl_idname, text="Transfer UV Data", icon='FORWARD').mode = 'SEL'
+            l.operator(UV_OT_transfer.bl_idname, text="Transfer All UV Data", icon='FORWARD').mode = 'ALL'
+            l.operator(UV_OT_transfer.bl_idname, text="Replace All UV Data", icon='FILE_REFRESH').mode = 'REP'
+
+# === PANEL ===
 
 class UVMAPSPLUS_PT_panel(Panel):
     bl_label = "UV Maps+"
-    bl_idname = "DATA_PT_uv_texture"
+    bl_idname = "UVMAPSPLUS_PT_panel"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "data"
+    
     @classmethod
-    def poll(cls, context): return (context.object and context.object.type == 'MESH')
-    def draw(self, context):
-        layout = self.layout
-        obj = context.object
-        mesh = obj.data
-        uv_layers = mesh.uv_layers
-        row = layout.row()
+    def poll(cls, ctx): return ctx.object and ctx.object.type == 'MESH'
+    
+    def draw(self, ctx):
+        l = self.layout
+        mesh = ctx.object.data
+        uvs = mesh.uv_layers
+        
+        row = l.row()
         col = row.column()
-        list_rows = 5 if len(uv_layers) > 0 else 2
-        col.template_list("MESH_UL_uvmaps", "", mesh, "uv_layers", uv_layers, "active_index", rows=list_rows)
+        col.template_list("MESH_UL_uvmaps_plus", "", mesh, "uv_layers", uvs, "active_index", rows=5 if uvs else 2)
         col = row.column(align=True)
-        col.operator(UV_OT_add_map.bl_idname, icon='ADD', text="")
-        col.operator(UV_OT_remove_map.bl_idname, icon='REMOVE', text="")
+        col.operator(UV_OT_add.bl_idname, icon='ADD', text="")
+        col.operator(UV_OT_remove.bl_idname, icon='REMOVE', text="")
         col.separator()
-        col.menu(UV_MT_specials_menu.bl_idname, icon='DOWNARROW_HLT', text="")
-        if len(uv_layers) > 0:
+        col.menu(UV_MT_specials.bl_idname, icon='DOWNARROW_HLT', text="")
+        if uvs:
             col.separator()
-            col.operator(UV_OT_reorder_map_up.bl_idname, text="", icon='TRIA_UP')
-            col.operator(UV_OT_reorder_map_down.bl_idname, text="", icon='TRIA_DOWN')
-        if obj.mode == 'EDIT':
-            layout.separator()
-            row = layout.row(align=True)
-            row.operator(UV_OT_copy_selected_uvs.bl_idname, text="Copy UVs", icon='COPYDOWN')
-            row.operator(UV_OT_paste_selected_uvs.bl_idname, text="Paste UVs", icon='PASTEDOWN')
-        if len(uv_layers) > 8:
-            layout.separator()
-            box = layout.box()
-            box.alert = True
-            box.label(text="Over 8 UV Maps: UV Editor & Export may only show up to 8.", icon='INFO')
+            col.operator(UV_OT_move.bl_idname, text="", icon='TRIA_UP').direction = 'UP'
+            col.operator(UV_OT_move.bl_idname, text="", icon='TRIA_DOWN').direction = 'DOWN'
+        
+        sel = get_meshes(ctx)
+        show_batch = len(sel) > 1 and ctx.object.mode == 'OBJECT'
+        show_slot_warning = uvs and uvs.active_index >= 8
+        
+        if show_batch or show_slot_warning:
+            l.separator()
+            box = l.box()
+            if show_batch:
+                box.label(text=f"Batch: {len(sel)} objects", icon='OBJECT_DATA')
+            if show_slot_warning:
+                box.alert = True
+                box.label(text="Slot 9+ cannot be edited in UV Editor. Move to slot 1-8 to edit.", icon='ERROR')
+        
+        if ctx.object.mode == 'EDIT':
+            l.separator()
+            row = l.row(align=True)
+            row.operator(UV_OT_copy_uvs.bl_idname, text="Copy UVs", icon='COPYDOWN')
+            row.operator(UV_OT_paste_uvs.bl_idname, text="Paste UVs", icon='PASTEDOWN')
+
+# === REGISTER ===
 
 classes = (
-    UV_OT_add_map,
-    UV_OT_remove_map,
-    UV_OT_reorder_map_up,
-    UV_OT_reorder_map_down,
-    UV_OT_duplicate_selected,
-    UV_OT_sort_by_name,
-    UV_OT_reverse_order,
-    UV_OT_delete_all,
-    UV_OT_copy_selected_uvs,
-    UV_OT_paste_selected_uvs,
-    UV_MT_specials_menu,
-    UV_OT_move_to_top,
-    UV_OT_move_to_bottom,
-    UVMAPSPLUS_PT_panel,
+    UV_OT_add, UV_OT_remove, UV_OT_duplicate, UV_OT_move, UV_OT_sort, UV_OT_reverse, UV_OT_delete_empty, UV_OT_delete_all,
+    UV_OT_sync_order, UV_OT_copy_unique, UV_OT_transfer, UV_OT_copy_uvs, UV_OT_paste_uvs,
+    MESH_UL_uvmaps_plus, UV_MT_specials, UVMAPSPLUS_PT_panel,
 )
 
+_default_panel = None
+
 def register():
-    try: bpy.utils.unregister_class(bpy.types.DATA_PT_uv_texture)
-    except RuntimeError: pass
+    global _default_panel
+    for name in ('DATA_PT_uv_texture', 'DATA_PT_mesh_uv_maps'):
+        if hasattr(bpy.types, name):
+            try:
+                _default_panel = getattr(bpy.types, name)
+                bpy.utils.unregister_class(_default_panel)
+                break
+            except: pass
     for cls in classes: bpy.utils.register_class(cls)
+    if sync_handler not in depsgraph_update_post: depsgraph_update_post.append(sync_handler)
 
 def unregister():
+    if sync_handler in depsgraph_update_post: depsgraph_update_post.remove(sync_handler)
     for cls in reversed(classes):
         try: bpy.utils.unregister_class(cls)
-        except RuntimeError: pass
-    try:
-        from bpy.types import DATA_PT_uv_texture
-        bpy.utils.register_class(DATA_PT_uv_texture)
-    except (ImportError, RuntimeError): pass
+        except: pass
+    if _default_panel:
+        try: bpy.utils.register_class(_default_panel)
+        except: pass
