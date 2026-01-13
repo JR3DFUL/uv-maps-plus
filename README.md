@@ -1,6 +1,6 @@
 # UV Maps+
 
-UV Maps+ is a Blender Extension that removes the 8 UV map limit, allows for UV reordering, and adds batch editing tools for managing UV maps across multiple objects.
+UV Maps+ *(UV Maps Plus)* is a Blender Extension that removes the 8 UV map limit, allows for UV reordering, and adds batch editing tools for managing UV maps across multiple objects.
 
 ---
 ## Features
