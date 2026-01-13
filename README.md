@@ -13,6 +13,6 @@ UV Maps+ is a Blender Extension that removes the 8 UV map limit, allows for UV r
 ---
 [![Discord](https://jr3dful.github.io/jr3dful-documentation/media/Banner_Gumroad.png)](https://jr3dful.gumroad.com/l/uvmapsplus)
 
-[![Github](https://jr3dful.github.io/jr3dful-documentation/media/Banner_Github.png)](https://github.com/JR3DFUL/uv-maps-plus)
+[![Extensions](https://jr3dful.github.io/jr3dful-documentation/media/Banner_Extensions.png)](https://extensions.blender.org/add-ons/uv-maps-plus/)
 
 [![Discord](https://jr3dful.github.io/jr3dful-documentation/media/Banner_Discord.png)](https://discord.com/invite/zGZnQv7mYV)
