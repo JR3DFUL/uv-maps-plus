@@ -1,41 +1,18 @@
-## UV Maps+
+# UV Maps+
 
-UV Maps+ (UV Maps Plus) provides essential tools for UV map management in Blender, allowing you to reorder UV maps, copy/paste UVs between layers, and exceed the software's default 8-map limit. These capabilities are made possible by storing UV data as custom attributes, which are managed through a new, dedicated UI panel.
+UV Maps+ is a Blender Extension that removes the 8 UV map limit, allows for UV reordering, and adds batch editing tools for managing UV maps across multiple objects.
 
-### Features
+---
+## Features
 
-Main Panel Controls
+* **Reorder UV maps** with `▲`/`▼` arrows or move directly to top/bottom
+* **Specials menu** with sort, reverse, duplicate, and delete options
+* **Batch operations** for multiple selected objects: sync order, copy unique map names, and transfer UV data (matching topology required)
+* **Edit Mode tools** for copying and pasting UV coordinates between selections
+* **Warning system** highlights UV maps in slots 9+ that cannot be edited in Blender's UV Editor—reorder to slots 1–8 to edit
+---
+[![Discord](https://jr3dful.github.io/jr3dful-documentation/media/Banner_Gumroad.png)](https://jr3dful.gumroad.com/l/uvmapsplus)
 
-* `+` (Add UV Map): Adds a new, blank UV map to the list, bypassing the 8-map limit.
+[![Extensions](https://jr3dful.github.io/jr3dful-documentation/media/Banner_Extensions.png)](https://extensions.blender.org/add-ons/uv-maps-plus/)
 
-* `-` (Remove UV Map): Deletes the currently selected UV map.
-
-* `▼` (Specials Menu): Opens a dropdown menu with more advanced management tools (see below).
-
-* `▲` (Move Up): Moves the selected UV map one position up in the list.
-
-* `▼` (Move Down): Moves the selected UV map one position down in the list.
-
-Specials Menu (Dropdown)
-
-* Sort Maps by Name: Alphabetically sorts all UV maps in the list.
-
-* Reverse Map Order: Reverses the current order of all UV maps.
-
-* Move to Top: Instantly moves the selected UV map to the top of the list.
-
-* Move to Bottom: Instantly moves the selected UV map to the bottom of the list.
-
-* Duplicate Selected: Creates an exact copy of the selected UV map.
-
-* Delete All UV Maps: Removes all UV maps from the object.
-
-Edit Mode Tools
-
-* Copy UVs: While in Edit Mode, this copies the UV coordinates of your current vertex selection on the active UV map.
-
-* Paste UVs: Pastes the copied UV coordinates onto the corresponding vertices of the active UV map.
-
-Warning System
-
-When you have more than 8 UV maps, a notice will appear. While the add-on can store unlimited maps, Blender's UV Editor can only *preview** the first 8 at a time. To see a map beyond the 8th slot, simply use the reordering arrows to move it into one of the top 8 positions.
+[![Discord](https://jr3dful.github.io/jr3dful-documentation/media/Banner_Discord.png)](https://discord.com/invite/zGZnQv7mYV)
